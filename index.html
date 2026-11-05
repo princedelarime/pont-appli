@@ -86,8 +86,12 @@ async function scellerJS(cle,valeur){const nonce=crypto.getRandomValues(new Uint
 async function ouvrirJS(cle,message){if(typeof message!=='string'||message.length>4096||!message.startsWith('v1.'))throw Error('format');const brut=depuis64(message.slice(3));if(brut.length<28)throw Error('format');const key=await crypto.subtle.importKey('raw',cle,'AES-GCM',false,['decrypt']);const clair=await crypto.subtle.decrypt({name:'AES-GCM',iv:brut.slice(0,12),tagLength:128},key,brut.slice(12));return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(await comprimer(new Uint8Array(clair),true)))}
 // DIRECT_CRYPTO_FIN
 let directPret=false,clesDirect=null,sourceDirect=null,dernierDirect=0,seqDirect=-1,tsDirect=-1,reconnexion=false,demarrageDirect=Date.now(),position={};
+const INTERVALLE_PRESENCE=30*60*1000;
+let dernierSignal=0,pauseRelais=0,economieDirect=false;
+function clePresence(){return "pont-presence-"+clesDirect.topic_cmd.slice(-8)}
+function memoriserSignal(){dernierSignal=Date.now();try{localStorage.setItem(clePresence(),String(dernierSignal))}catch(e){}}
 const enAttente=new Map();
-function fraicheurTexte(maintenant=Date.now()/1000){const age=maintenant-(dernierDirect||etat.date||0);if(dernierDirect&&age<150&&!reconnexion)return '🟢 En direct · mis à jour '+(age<60?'il y a '+Math.max(0,Math.floor(age))+' s':'il y a '+Math.floor(age/60)+' min');if(directPret&&age<150||directPret&&!dernierDirect&&Date.now()-demarrageDirect<20000)return '🟡 Connexion au PC…';return '🔴 Hors ligne — infos de '+(etat.date?new Date(etat.date*1000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}):'date inconnue')}
+function fraicheurTexte(maintenant=Date.now()/1000){const age=maintenant-(dernierDirect||etat.date||0);if(pauseRelais>Date.now())return '🟠 Limite du relais atteinte · utilise le chat Telegram';if(economieDirect)return '🟡 Économie de messages · actualise avec ↻';if(dernierDirect&&age<2100&&!reconnexion)return (age<150?'🟢 En direct · mis à jour ':'🟢 Relié · dernier état ')+(age<60?'il y a '+Math.max(0,Math.floor(age))+' s':'il y a '+Math.floor(age/60)+' min');if(directPret&&age<150||directPret&&!dernierDirect&&Date.now()-demarrageDirect<20000)return '🟡 Connexion au PC…';return '🔴 Hors ligne — infos de '+(etat.date?new Date(etat.date*1000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}):'date inconnue')}
 function fraicheur(){const b=document.querySelector('#fraicheur');if(b)b.textContent=fraicheurTexte()}
 function statutEnvoi(texte){const e=document.querySelector('#envoi');if(e)e.textContent=texte}
 function rafraichirVue(){
@@ -117,12 +121,42 @@ async function appliquerDirect(message){try{
  if(d.seq<=seqDirect||d.ts<tsDirect)return;
  for(const id of d.acks){if(enAttente.has(id)){clearTimeout(enAttente.get(id));enAttente.delete(id);statutEnvoi('✅ Reçu par le PC')}}
  const ancien=JSON.stringify({...etat,date:0}),suivant=JSON.stringify({...d.etat,date:0});
- seqDirect=d.seq;tsDirect=d.ts;dernierDirect=d.ts;reconnexion=false;etat=d.etat;fraicheur();
+ economieDirect=!!d.economie&&new Date(d.ts*1000).toISOString().slice(0,10)===new Date().toISOString().slice(0,10);seqDirect=d.seq;tsDirect=d.ts;dernierDirect=d.ts;reconnexion=false;etat=d.etat;fraicheur();
  if(ancien!==suivant)rafraichirVue();
  }catch(e){/* Ignorer le contenu du relais sans le journaliser. */}}
-async function envoyerDirect(cmd,silencieux=false){const id=Array.from(crypto.getRandomValues(new Uint8Array(8)),b=>b.toString(16).padStart(2,'0')).join('');if(cmd.a==='fil')requetesFil.set(id,cmd.conversation);if(!silencieux){statutEnvoi('⏳ Envoi…');enAttente.set(id,setTimeout(()=>{enAttente.delete(id);statutEnvoi('⚠️ Pas de réponse du PC')},20000))}try{const corps=await scellerJS(clesDirect.k_cmd,{t:'cmd',id,ts:Date.now()/1000,cmd});if(corps.length>4096)throw Error('taille');const reponse=await fetch('https://ntfy.sh/'+clesDirect.topic_cmd,{method:'POST',headers:{'Content-Type':'text/plain','Cache':'yes'},body:corps,referrerPolicy:'no-referrer'});if(!reponse.ok)throw Error('relais')}catch(e){/* Attendre l'accusé sans risquer un double envoi Telegram. */}}
-async function demarrerDirect(secret){if(!secret||!globalThis.crypto?.subtle)return;try{clesDirect=await derives(depuis64(secret));directPret=true;fraicheur();const url='https://ntfy.sh/'+clesDirect.topic_etat;fetch(url+'/json?poll=1&since=latest',{referrerPolicy:'no-referrer'}).then(async r=>{if(!r.ok)return;const texte=await r.text();if(texte.length>32768)return;for(const ligne of texte.split('\n')){try{const e=JSON.parse(ligne);if(e.event==='message')await appliquerDirect(e.message)}catch(e){}}}).catch(()=>{});sourceDirect=new EventSource(url+'/sse');sourceDirect.addEventListener('message',e=>{try{const d=JSON.parse(e.data);if(d.event==='message')appliquerDirect(d.message)}catch(e){}});sourceDirect.onerror=()=>{reconnexion=true;fraicheur()};sourceDirect.onopen=()=>{reconnexion=false;fraicheur()};pingDirect();setInterval(()=>{if(document.visibilityState!=='hidden')pingDirect()},120000);document.addEventListener?.('visibilitychange',()=>{if(document.visibilityState==='visible')pingDirect()})}catch(e){directPret=false;fraicheur()}}
-function pingDirect(){if(directPret)envoyerDirect({v:1,a:'ping'},true)}
+async function envoyerDirect(cmd,silencieux=false){
+ if(pauseRelais>Date.now()){if(!silencieux)statutEnvoi('⚠️ Limite du relais : rien envoyé. Continue dans le chat Telegram.');if(cmd.a==='fil')filsDemandes.delete(cmd.conversation);else rafraichirVue();return;}
+ const id=Array.from(crypto.getRandomValues(new Uint8Array(8)),b=>b.toString(16).padStart(2,'0')).join('');
+ if(cmd.a==='fil')requetesFil.set(id,cmd.conversation);
+ if(!silencieux){statutEnvoi('⏳ Envoi…');enAttente.set(id,setTimeout(()=>{enAttente.delete(id);statutEnvoi('⚠️ Pas de réponse du PC')},20000))}
+ try{
+  const corps=await scellerJS(clesDirect.k_cmd,{t:'cmd',id,ts:Date.now()/1000,cmd});if(corps.length>4096)throw Error('taille');
+  const reponse=await fetch('https://ntfy.sh/'+clesDirect.topic_cmd,{method:'POST',headers:{'Content-Type':'text/plain','Cache':'yes'},body:corps,referrerPolicy:'no-referrer'});
+  if(reponse.status===429){
+   // Refus explicite : aucune action n'a été acceptée, aucun renvoi automatique.
+   pauseRelais=Date.now()+3600000;
+   try{const erreur=JSON.parse(await reponse.text());if(erreur.code!==42908)pauseRelais=Date.now()+60000}catch(e){}
+   if(enAttente.has(id)){clearTimeout(enAttente.get(id));enAttente.delete(id)}
+   requetesFil.delete(id);if(cmd.a==='fil')filsDemandes.delete(cmd.conversation);
+   statutEnvoi('⚠️ Limite du relais : rien envoyé. Continue dans le chat Telegram.');fraicheur();rafraichirVue();return;
+  }
+  if(!reponse.ok)throw Error('relais');
+  memoriserSignal();
+ }catch(e){/* Attendre l'accusé sans risquer un double envoi Telegram. */}
+}
+async function demarrerDirect(secret){if(!secret||!globalThis.crypto?.subtle)return;try{
+ clesDirect=await derives(depuis64(secret));directPret=true;
+ try{const signal=Number(localStorage.getItem(clePresence()));if(Number.isFinite(signal)&&signal<=Date.now())dernierSignal=signal}catch(e){}
+ fraicheur();const url='https://ntfy.sh/'+clesDirect.topic_etat;
+ // Les lectures ne publient rien. Inclure le dernier état même si un fil a été envoyé ensuite.
+ fetch(url+'/json?poll=1&since=35m',{referrerPolicy:'no-referrer'}).then(async r=>{if(!r.ok)return;const texte=await r.text();if(texte.length>262144)return;for(const ligne of texte.split('\n')){try{const e=JSON.parse(ligne);if(e.event==='message')await appliquerDirect(e.message)}catch(e){}}}).catch(()=>{});
+ sourceDirect=new EventSource(url+'/sse');sourceDirect.addEventListener('message',e=>{try{const d=JSON.parse(e.data);if(d.event==='message')appliquerDirect(d.message)}catch(e){}});
+ sourceDirect.onerror=()=>{reconnexion=true;fraicheur()};sourceDirect.onopen=()=>{reconnexion=false;fraicheur()};
+ pingDirect();setInterval(()=>{if(document.visibilityState!=='hidden')pingDirect()},60000);
+ document.addEventListener?.('visibilitychange',()=>{if(document.visibilityState==='visible')pingDirect()})
+ }catch(e){directPret=false;fraicheur()}}
+function pingDirect(){if(economieDirect&&new Date(tsDirect*1000).toISOString().slice(0,10)!==new Date().toISOString().slice(0,10))economieDirect=false;if(directPret&&!economieDirect&&pauseRelais<=Date.now()&&(!dernierSignal||Date.now()-dernierSignal>=INTERVALLE_PRESENCE)){memoriserSignal();return envoyerDirect({v:1,a:'ping'},true)}}
+
 if(typeof setInterval==='function')setInterval(()=>{fraicheur();for(const e of document.querySelectorAll?.('[data-debut]')||[])e.textContent=Math.max(0,Math.floor(Date.now()/1000-Number(e.dataset.debut)))+' s'},1000);
 (async()=>{try{tg?.ready();tg?.expand();const t=tg?.themeParams||{};for(const[k,v]of Object.entries({'--fond':t.bg_color,'--carte':t.secondary_bg_color,'--texte':t.text_color,'--second':t.hint_color,'--accent':t.button_color}))if(v)document.documentElement.style.setProperty(k,v);const params=new URLSearchParams(location.hash.slice(1));if(params.get('d')){try{etat=await decoder(params.get('d'))}catch(e){if(!params.get('j'))throw e;etat=await decoder(params.get('j'))}}document.querySelector('#nav').append(bouton('🏠 Accueil',accueil),bouton('📂 Projets',()=>projets()),bouton('⚖️ Quotas',agents),bouton('⚙️ Réglages',reglages));accueil();fraicheur();demarrerDirect(params.get('k'))}catch(e){app.replaceChildren(el('h1','État indisponible'),el('p','Reviens au bot et appuie sur Accueil, puis ouvre l’appli à nouveau.'))}})();
 </script></body></html>
